@@ -81,7 +81,7 @@ counter_test_() ->
      [
       ?_test(test_operations()),
       ?_test(find_counters()),
-      ?_test(benchmark()),
+      {timeout, 60, ?_test(benchmark())},
       ?_test(test_reset())
      ]
     }.

@@ -2,24 +2,28 @@
 %%
 %% statman_aggregator receives metrics from statman_servers running in
 %% your cluster, picks them apart and keeps a moving window of the raw
-%% values. On demand, the samples are aggregated together. Metrics
-%% with the same key, but from different nodes are also merged.
+%% values. On demand, the samples are aggregated together.
 -module(statman_aggregator).
 -behaviour(gen_server).
 
--export([start_link/0, get_window/1, get_keys/0]).
+-export([start_link/0, get_window/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--include_lib("eunit/include/eunit.hrl").
+-export([merge_samples/2]). %% used for histograms in node aggregator
 
 -record(state, {
           subscribers = [],
           last_sample = [],
           metrics = dict:new()
-
          }).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
+-define(MAX_WINDOW, 300). %% 5 min
 
 %%%===================================================================
 %%% API
@@ -31,47 +35,28 @@ start_link() ->
 get_window(Size) ->
     gen_server:call(?MODULE, {get_window, Size}).
 
-get_keys() ->
-    gen_server:call(?MODULE, get_keys).
-
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
     timer:send_interval(10000, push),
-    {ok, #state{metrics = dict:new()}}.
+    {ok, #state{subscribers = [], metrics = dict:new()}}.
+
 
 handle_call({add_subscriber, Ref}, _From, #state{subscribers = Sub} = State) ->
     {reply, ok, State#state{subscribers = [Ref | Sub]}};
 handle_call({remove_subscriber, Ref}, _From, #state{subscribers = Sub} = State) ->
     {reply, ok, State#state{subscribers = lists:delete(Ref, Sub)}};
 
-
 handle_call({get_window, Size}, _From, #state{metrics = Metrics} = State) ->
-    PurgedMetrics = dict:map(fun (_, {Type, Samples}) ->
-                                     {Type, purge(Samples)}
-                             end, Metrics),
-
-    Aggregated = lists:map(
-                   fun ({{Node, Key}, {Type, Samples}}) ->
-                           {Node, Key, Type, merge_samples(Type, window(Size, Samples))}
-                   end, dict:to_list(PurgedMetrics)),
-
-    Reply = format(Size, Aggregated) ++ format(Size, merge(Aggregated)),
-    {reply, {ok, Reply}, State#state{metrics = PurgedMetrics}};
-
-
-handle_call(get_keys, _From, State) ->
-    Reply = dict:fold(fun (Key, {Type, _Samples}, Acc) ->
-                              [{Key, Type} | Acc]
-                      end, [], State#state.metrics),
-    {reply, {ok, Reply}, State}.
-
+    PurgedMetrics = purge(now_to_seconds() - ?MAX_WINDOW, Metrics),
+    Reply = merge_window(Size, PurgedMetrics),
+    {reply, {ok, Reply}, State#state{metrics = PurgedMetrics}}.
 
 
 handle_cast({statman_update, NewSamples}, #state{metrics = Metrics} = State) ->
-    NewMetrics = lists:foldl(fun insert/2, Metrics, NewSamples),
+    NewMetrics = insert(NewSamples, Metrics),
     {noreply, State#state{metrics = NewMetrics}}.
 
 handle_info(_, State) ->
@@ -87,16 +72,19 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+insert(Samples, Metrics) ->
+    lists:foldl(fun (Sample, Acc) ->
+                        {Key, Value} = format(Sample),
+                        dict:update(Key, fun (Vs) -> [Value | Vs] end, [Value], Acc)
+                end, Metrics, Samples).
 
-insert(Metric, Metrics) ->
-    Samples = case dict:find(nodekey(Metric), Metrics) of
-                  {ok, {_Type, M}} -> M;
-                  error -> []
-              end,
-
-    dict:store(nodekey(Metric),
-               {type(Metric), [{now_to_seconds(), value(Metric)} | Samples]},
-               Metrics).
+merge_window(Size, Metrics) ->
+    lists:map(
+        fun ({Key, Value}) -> unformat(Key, Value, Size) end,
+        dict:to_list(
+            dict:map(fun ({_Key, Type, _Node}, Samples) ->
+                             merge_samples(Type, window(Size, Samples))
+                     end, Metrics))).
 
 window(_, []) ->
     [];
@@ -106,43 +94,15 @@ window(1, [{_, Sample} | _]) ->
 window(Size, Samples) ->
     element(2, lists:unzip(samples_after(now_to_seconds() - Size, Samples))).
 
-purge(Samples) ->
-    samples_after(now_to_seconds() - 300, Samples).
-
+purge(ExpiryTime, Metrics) ->
+    dict:filter(
+        fun (_Key, Samples) -> Samples =/= [] end,
+        dict:map(fun (_Key, Samples) ->
+                         samples_after(ExpiryTime, Samples)
+                 end, Metrics)).
 
 samples_after(Threshold, Samples) ->
     lists:takewhile(fun ({Ts, _}) -> Ts >= Threshold end, Samples).
-
-
-
-merge(Metrics) ->
-    {_, Merged} =
-        lists:unzip(
-          orddict:to_list(
-            lists:foldl(
-              fun ({_, _, gauge, _}, Acc) ->
-                      Acc;
-
-                  ({Node, Key, counter, Sample}, Acc) ->
-                      case orddict:find(Key, Acc) of
-                          {ok, {Nodes, Key, counter, OtherSample}} ->
-                              orddict:store(Key, {[Node | Nodes], Key, counter,
-                                                  Sample + OtherSample}, Acc);
-                          error ->
-                              orddict:store(Key, {[Node], Key, counter, Sample}, Acc)
-                      end;
-
-                  ({Node, Key, Type, Samples}, Acc) ->
-                      case orddict:find(Key, Acc) of
-                          {ok, {Nodes, Key, Type, OtherSamples}} ->
-                              Merged = merge_samples(Type, [Samples, OtherSamples]),
-                              orddict:store(Key, {[Node | Nodes], Key, Type, Merged}, Acc);
-                          error ->
-                              orddict:store(Key, {[Node], Key, Type, Samples}, Acc)
-                      end
-              end, orddict:new(), Metrics))),
-
-    lists:filter(fun ({Nodes, _, _, _}) -> length(Nodes) > 1 end, Merged).
 
 
 merge_samples(histogram, Samples) ->
@@ -154,42 +114,29 @@ merge_samples(histogram, Samples) ->
                                       Agg)
                 end, orddict:new(), Samples);
 
-
 merge_samples(counter, Samples) ->
     lists:sum(Samples);
 
 merge_samples(gauge, []) ->
     0;
 merge_samples(gauge, Samples) ->
-    lists:last(
-      lists:filter(fun ([]) -> false;
-                       (_)  -> true
-                   end, Samples)).
+    hd(Samples).
 
+format(Metric) ->
+    {internal_key(Metric),
+     {now_to_seconds(), proplists:get_value(value, Metric)}}.
 
+unformat({Key, Type, Node}, Value, Size) ->
+    [{key, Key},
+     {type, Type},
+     {value, Value},
+     {node, Node},
+     {window, Size * 1000}].
 
-format(_, []) ->
-    [];
-
-format(Size, [{Nodes, Key, Type, Value} | Rest]) ->
-    [
-     [{key, Key},
-      {node, Nodes},
-      {type, Type},
-      {value, Value},
-      {window, Size * 1000}]
-
-     | format(Size, Rest)].
-
-
-
-type(Metric)  -> proplists:get_value(type, Metric).
-value(Metric) -> proplists:get_value(value, Metric).
-
-nodekey(Metric) ->
-    {proplists:get_value(node, Metric),
-     proplists:get_value(key, Metric)}.
-
+internal_key(Metric) ->
+    {proplists:get_value(key, Metric),
+     proplists:get_value(type, Metric),
+     proplists:get_value(node, Metric)}.
 
 now_to_seconds() ->
     {MegaSeconds, Seconds, _} = os:timestamp(),
@@ -200,45 +147,88 @@ now_to_seconds() ->
 %% TESTS
 %%
 
-window_test() ->
-    {ok, P} = start_link(),
+-ifdef(TEST).
+aggregator_test_() ->
+    {foreach,
+     fun setup/0, fun teardown/1,
+     [?_test(expire()),
+      ?_test(window())
+     ]
+    }.
 
-    gen_server:cast(P, {statman_update, [sample_histogram('a@knutin')]}),
-    gen_server:cast(P, {statman_update, [sample_histogram('b@knutin')]}),
-    gen_server:cast(P, {statman_update, [sample_counter('a@knutin')]}),
-    gen_server:cast(P, {statman_update, [sample_counter('b@knutin')]}),
+setup() ->
+    {ok, Pid} = start_link(),
+    true = unlink(Pid),
+    Pid.
+
+teardown(Pid) ->
+    exit(Pid, kill),
+    timer:sleep(1000),
+    false = is_process_alive(Pid).
+
+expire() ->
+    gen_server:cast(?MODULE, {statman_update, [sample_histogram('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_counter('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_counter('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_gauge('a@knutin', 1)]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_gauge('a@knutin', 3)]}),
+
+    ?assert(lists:all(fun (M) ->
+                              V = proplists:get_value(value, M, 0),
+                              V =/= 0 andalso V =/= []
+                      end, element(2, get_window(2)))),
+
+    timer:sleep(3000),
+
+    ?assert(lists:all(fun (M) ->
+                              V = proplists:get_value(value, M),
+                              V == 0 orelse V =:= []
+                      end, element(2, get_window(2)))).
+
+window() ->
+    gen_server:cast(?MODULE, {statman_update, [sample_histogram('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_counter('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_counter('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_gauge('a@knutin', 1)]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_gauge('a@knutin', 3)]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_histogram('b@knutin')]}),
 
     timer:sleep(1000),
 
-    gen_server:cast(P, {statman_update, [sample_histogram('a@knutin')]}),
-    gen_server:cast(P, {statman_update, [sample_histogram('b@knutin')]}),
-    gen_server:cast(P, {statman_update, [sample_counter('a@knutin')]}),
-    gen_server:cast(P, {statman_update, [sample_counter('b@knutin')]}),
-
-    ?assertEqual([
-                  {nodekey(sample_counter('a@knutin')), counter},
-                  {nodekey(sample_histogram('a@knutin')), histogram},
-                  {nodekey(sample_counter('b@knutin')), counter},
-                  {nodekey(sample_histogram('b@knutin')), histogram}
-                 ], lists:sort(element(2, get_keys()))),
+    gen_server:cast(?MODULE, {statman_update, [sample_histogram('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_histogram('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_counter('a@knutin')]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_gauge('a@knutin', 2)]}),
+    gen_server:cast(?MODULE, {statman_update, [sample_histogram('b@knutin')]}),
 
     {ok, Aggregated} = get_window(60),
 
-    [_ACounter, _BCounter, MergedCounter,
-     _AHistogram, _BHistogram, MergedHistogram] = lists:sort(Aggregated),
+    [MergedCounter, MergedGauge, MergedHistogramB, MergedHistogramA] = lists:sort(Aggregated),
 
 
     ?assertEqual([{key, {<<"/highscores">>,db_a_latency}},
-                  {node, ['a@knutin', 'b@knutin']},
                   {type, histogram},
-                  {value, [{1, 4}, {2, 8}, {3, 12}]},
-                  {window, 60000}], MergedHistogram),
+                  {value, [{1, 3}, {2, 6}, {3, 9}]},
+                  {node, 'a@knutin'},
+                  {window, 60000}], MergedHistogramA),
+
+    ?assertEqual([{key, {<<"/highscores">>,db_a_latency}},
+                  {type, histogram},
+                  {value, [{1, 2}, {2, 4}, {3, 6}]},
+                  {node, 'b@knutin'},
+                  {window, 60000}], MergedHistogramB),
 
     ?assertEqual([{key, {foo, bar}},
-                  {node, ['a@knutin', 'b@knutin']},
                   {type, counter},
-                  {value, 120},
-                  {window, 60000}], MergedCounter).
+                  {value, 90},
+                  {node, 'a@knutin'},
+                  {window, 60000}], MergedCounter),
+
+    ?assertEqual([{key, {foo, bar}},
+                  {type, gauge},
+                  {value, 2},
+                  {node, 'a@knutin'},
+                  {window, 60000}], MergedGauge).
 
 
 
@@ -259,3 +249,11 @@ sample_counter(Node) ->
      {type,counter},
      {value,30},
      {window,1000}].
+
+sample_gauge(Node, Value) ->
+    [{key,{foo, bar}},
+     {node,Node},
+     {type,gauge},
+     {value,Value},
+     {window,1000}].
+-endif.
