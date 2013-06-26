@@ -49,10 +49,13 @@ handle_call({add_subscriber, Ref}, _From, #state{subscribers = Sub} = State) ->
 handle_call({remove_subscriber, Ref}, _From, #state{subscribers = Sub} = State) ->
     {reply, ok, State#state{subscribers = lists:delete(Ref, Sub)}};
 
-handle_call({get_window, Size}, _From, #state{metrics = Metrics} = State) ->
+handle_call({get_window, Size}, From, #state{metrics = Metrics} = State) ->
     PurgedMetrics = purge(now_to_seconds() - ?MAX_WINDOW, Metrics),
-    Reply = merge_window(Size, PurgedMetrics),
-    {reply, {ok, Reply}, State#state{metrics = PurgedMetrics}}.
+    spawn(fun () ->
+                  Merged = merge_window(Size, PurgedMetrics),
+                  gen_server:reply(From, {ok, Merged})
+          end),
+    {noreply, State#state{metrics = PurgedMetrics}}.
 
 
 handle_cast({statman_update, NewSamples}, #state{metrics = Metrics} = State) ->
