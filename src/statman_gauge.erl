@@ -28,7 +28,7 @@ incr(Key, Incr) ->
             set(Key, Incr),
             ok;
         _ ->
-            ets:update_element(?TABLE, Key, {2, now_to_seconds()}),
+            (catch ets:update_element(?TABLE, Key, {2, now_to_seconds()})),
             ok
     end.
 
@@ -38,10 +38,18 @@ expire() ->
 %% @doc: Deletes any gauges that has not been updated since the given
 %% threshold.
 expire(Threshold) ->
-    ets:select_delete(?TABLE, [{{'_', '$1', '_'}, [{'<', '$1', Threshold}], [true]}]).
+    try
+        ets:select_delete(?TABLE, [{{'_', '$1', '_'}, [{'<', '$1', Threshold}], [true]}])
+    catch
+        error:badarg -> 0
+    end.
 
 get_all() ->
-    ets:select(?TABLE, [{ {'$1', '_', '$2'}, [], [{{'$1', '$2'}}]}]).
+    try
+        ets:select(?TABLE, [{ {'$1', '_', '$2'}, [], [{{'$1', '$2'}}]}])
+    catch
+        error:badarg -> []
+    end.
 
 now_to_seconds() ->
     {MegaSeconds, Seconds, _} = os:timestamp(),
@@ -61,6 +69,7 @@ gauge_test_() ->
       ?_test(test_set_incr())
      ]
     }.
+
 
 setup() ->
     init(),
@@ -99,3 +108,10 @@ test_set_incr() ->
 
     decr(foo),
     ?assertEqual([{foo, 11}], get_all()).
+
+
+no_table_test() ->
+    ?assertEqual(ok, set(key, 1)),
+    ?assertEqual(ok, incr(key)),
+    ?assertEqual(0, expire()),
+    ?assertEqual([], get_all()).

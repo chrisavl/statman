@@ -40,22 +40,38 @@ record_value(UserKey, Value) when is_integer(Value) ->
     ok.
 
 keys() ->
-    %% TODO: Maybe keep a special table of all used keys?
-    lists:usort(ets:select(?TABLE, [{ { {'$1', '_'}, '_' }, [], ['$1'] }])).
+    try
+        %% TODO: Maybe keep a special table of all used keys?
+        lists:usort(ets:select(?TABLE, [{ { {'$1', '_'}, '_' }, [], ['$1'] }]))
+    catch
+        error:badarg -> []
+    end.
 
 gc() ->
-    ets:select_delete(?TABLE, [{ {{'_', '_'}, 0}, [], [true] }]).
+    try
+        ets:select_delete(?TABLE, [{ {{'_', '_'}, 0}, [], [true] }])
+    catch
+        error:badarg -> 0
+    end.
 
 clear(UserKey) ->
-    ets:select_delete(?TABLE, [{{{UserKey, '_'}, '_'}, [], [true]  }]).
+    try
+        ets:select_delete(?TABLE, [{{{UserKey, '_'}, '_'}, [], [true]  }])
+    catch
+        error:badarg -> 0
+    end.
 
 
 %% @doc: Returns the raw histogram recorded by record_value/2,
 %% suitable for passing to summary/1 and reset/2
 get_data(UserKey) ->
-    Query = [{{{UserKey, '$1'}, '$2'}, [{'>', '$2', 0}], [{{'$1', '$2'}}]}],
-    lists:sort(
-      ets:select(?TABLE, Query)).
+    try
+        Query = [{{{UserKey, '$1'}, '$2'}, [{'>', '$2', 0}], [{{'$1', '$2'}}]}],
+        lists:sort(
+            ets:select(?TABLE, Query))
+    catch
+        error:badarg -> []
+    end.
 
 
 %% @doc: Returns summary statistics from the raw data
@@ -87,8 +103,12 @@ summary(Data) ->
 reset(_UserKey, []) ->
     ok;
 reset(UserKey, [{Key, Value} | Data]) ->
-    ets:update_counter(?TABLE, {UserKey, Key}, -Value),
-    reset(UserKey, Data).
+    try
+        ets:update_counter(?TABLE, {UserKey, Key}, -Value),
+        reset(UserKey, Data)
+    catch
+        error:badarg -> ok
+    end.
 
 
 %%
@@ -286,6 +306,14 @@ test_binning() ->
     _BinnedSummary = summary(get_data(foo)),
 
     ok.
+
+no_table_test() ->
+    ?assertEqual([], keys()),
+    ?assertEqual(0, gc()),
+    ?assertEqual(0, clear(key)),
+    ?assertEqual([], get_data(key)),
+    ?assertEqual(ok, reset(key, [{1000, 42}])),
+    ?assertEqual(ok, record_value(key, 1000)).
 
 
 bin_test() ->
